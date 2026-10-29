@@ -21,6 +21,7 @@ end
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 local CoreGui = game:GetService("CoreGui")
@@ -72,20 +73,73 @@ local C = {
 local Drawings = {}
 local Connections = {}
 local ESPData = {}
+local OriginalHumanoidSettings = setmetatable({}, { __mode = "k" })
+local TransientConnections = {}
+local isUnloaded = false
 
 local hasDrawing = pcall(function()
+    assert(type(Drawing) == "table" and type(Drawing.new) == "function", "Drawing API indisponivel")
     local probe = Drawing.new("Square")
-    if probe.Remove then
-        pcall(function()
-            probe:Remove()
-        end)
-    end
+    assert(probe ~= nil, "Drawing.new nao retornou um objeto")
+    probe:Remove()
 end)
 
 local function bind(signal, fn)
-    local conn = signal:Connect(fn)
+    if isUnloaded then
+        return nil
+    end
+    local conn = signal:Connect(function(...)
+        if not isUnloaded then
+            fn(...)
+        end
+    end)
     Connections[#Connections + 1] = conn
     return conn
+end
+
+local function disconnect(conn)
+    if conn then
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+end
+
+local function connectTransient(signal, fn)
+    local conn = signal:Connect(fn)
+    TransientConnections[#TransientConnections + 1] = conn
+    return conn
+end
+
+local function disconnectTransient(conn)
+    if not conn then
+        return
+    end
+    disconnect(conn)
+    for i = #TransientConnections, 1, -1 do
+        if TransientConnections[i] == conn then
+            table.remove(TransientConnections, i)
+            break
+        end
+    end
+end
+
+local function removeDrawing(obj)
+    if not obj then
+        return
+    end
+    pcall(function()
+        obj.Visible = false
+    end)
+    pcall(function()
+        obj:Remove()
+    end)
+    for i = #Drawings, 1, -1 do
+        if Drawings[i] == obj then
+            table.remove(Drawings, i)
+            break
+        end
+    end
 end
 
 local function create(class, props, parent)
@@ -103,6 +157,12 @@ end
 
 local function getMousePos()
     return UserInputService:GetMouseLocation()
+end
+
+local function getViewportMousePos()
+    local mouse = getMousePos()
+    local insetTopLeft = GuiService:GetGuiInset()
+    return mouse - insetTopLeft
 end
 
 -- ============================================================
@@ -167,7 +227,7 @@ create("TextLabel", {
     Position = UDim2.fromOffset(96, 0),
     BackgroundTransparency = 1,
     Font = Enum.Font.Gotham,
-    Text = "rshift: menu    e: aim",
+    Text = "RIGHTSHIFT: menu   E: aim",
     TextSize = 11,
     TextColor3 = C.dim,
     TextXAlignment = Enum.TextXAlignment.Left,
@@ -192,15 +252,19 @@ end)
 local windowDragging = false
 local dragStart = nil
 local dragStartPos = nil
+local windowDragEndConnection = nil
 
 bind(title.InputBegan, function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
         windowDragging = true
         dragStart = input.Position
         dragStartPos = main.Position
-        bind(input.Changed, function()
+        disconnectTransient(windowDragEndConnection)
+        windowDragEndConnection = connectTransient(input.Changed, function()
             if input.UserInputState == Enum.UserInputState.End then
                 windowDragging = false
+                disconnectTransient(windowDragEndConnection)
+                windowDragEndConnection = nil
             end
         end)
     end
@@ -212,12 +276,15 @@ bind(UserInputService.InputChanged, function(input)
     end
     if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
         local delta = input.Position - dragStart
-        main.Position = UDim2.new(
-            dragStartPos.X.Scale,
-            dragStartPos.X.Offset + delta.X,
-            dragStartPos.Y.Scale,
-            dragStartPos.Y.Offset + delta.Y
-        )
+        local camera = Workspace.CurrentCamera
+        local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+        local width = main.AbsoluteSize.X
+        local height = main.AbsoluteSize.Y
+        local startX = viewport.X * dragStartPos.X.Scale + dragStartPos.X.Offset
+        local startY = viewport.Y * dragStartPos.Y.Scale + dragStartPos.Y.Offset
+        local x = math.clamp(startX + delta.X, width / 2, math.max(width / 2, viewport.X - width / 2))
+        local y = math.clamp(startY + delta.Y, height / 2, math.max(height / 2, viewport.Y - height / 2))
+        main.Position = UDim2.fromOffset(x, y)
     end
 end)
 
@@ -319,6 +386,10 @@ local function addToggleRow(page, y, label, tbl, key)
 end
 
 local function addSliderRow(page, y, label, tbl, key, min, max, decimals, suffix, onChange)
+    assert(type(min) == "number" and type(max) == "number" and max > min, "Intervalo de slider invalido")
+    decimals = math.max(0, math.floor(tonumber(decimals) or 0))
+    tbl[key] = math.clamp(tonumber(tbl[key]) or min, min, max)
+
     local row = create("Frame", {
         Size = UDim2.new(1, -24, 0, 46),
         Position = UDim2.fromOffset(12, y),
@@ -390,28 +461,40 @@ local function addSliderRow(page, y, label, tbl, key, min, max, decimals, suffix
     }, row)
 
     local sliding = false
+    local activeInput = nil
+    local sliderEndConnection = nil
 
     local function fromInput(input)
-        local rel = (input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X
-        rel = math.clamp(rel, 0, 1)
-        tbl[key] = min + (max - min) * rel
+        local trackWidth = track.AbsoluteSize.X
+        if trackWidth <= 0 then
+            return
+        end
+        local rel = math.clamp((input.Position.X - track.AbsolutePosition.X) / trackWidth, 0, 1)
+        local raw = min + (max - min) * rel
+        local scale = 10 ^ decimals
+        tbl[key] = math.clamp(math.floor(raw * scale + 0.5) / scale, min, max)
         apply(true)
     end
 
     bind(hit.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             sliding = true
+            activeInput = input
             fromInput(input)
-            bind(input.Changed, function()
+            disconnect(sliderEndConnection)
+            sliderEndConnection = connectTransient(input.Changed, function()
                 if input.UserInputState == Enum.UserInputState.End then
                     sliding = false
+                    activeInput = nil
+                    disconnectTransient(sliderEndConnection)
+                    sliderEndConnection = nil
                 end
             end)
         end
     end)
 
     bind(UserInputService.InputChanged, function(input)
-        if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement or (activeInput and input == activeInput)) then
             fromInput(input)
         end
     end)
@@ -421,6 +504,7 @@ local function addSliderRow(page, y, label, tbl, key, min, max, decimals, suffix
 end
 
 local function addCycleRow(page, y, label, tbl, key, options)
+    assert(type(options) == "table" and #options > 0, "Lista de opcoes vazia")
     local row = create("Frame", {
         Size = UDim2.new(1, -24, 0, 28),
         Position = UDim2.fromOffset(12, y),
@@ -548,17 +632,29 @@ end
 
 local function applyPlayer()
     local hum = getHumanoid()
-    if hum then
-        hum.UseJumpPower = true
-        hum.WalkSpeed = Config.Player.WalkSpeed
-        hum.JumpPower = Config.Player.JumpPower
+    if not hum or hum.Health <= 0 then
+        return
     end
+
+    if not OriginalHumanoidSettings[hum] then
+        OriginalHumanoidSettings[hum] = {
+            UseJumpPower = hum.UseJumpPower,
+            WalkSpeed = hum.WalkSpeed,
+            JumpPower = hum.JumpPower,
+        }
+    end
+
+    hum.UseJumpPower = true
+    hum.WalkSpeed = Config.Player.WalkSpeed
+    hum.JumpPower = Config.Player.JumpPower
 end
 
 bind(LP.CharacterAdded, function()
     if Config.Player.Dirty then
         task.wait(0.5)
-        applyPlayer()
+        if not isUnloaded then
+            applyPlayer()
+        end
     end
 end)
 
@@ -588,7 +684,7 @@ e = addToggleRow(pageESP, e, "Vida", Config.ESP, "Health")
 e = addToggleRow(pageESP, e, "Distancia", Config.ESP, "Distance")
 e = addToggleRow(pageESP, e, "Tracer", Config.ESP, "Tracer")
 e = addToggleRow(pageESP, e, "Team check", Config.ESP, "TeamCheck")
-e = addSliderRow(pageESP, e, "Distancia maxima", Config.ESP, "MaxDistance", 100, 3000, 0, "m")
+e = addSliderRow(pageESP, e, "Distancia maxima", Config.ESP, "MaxDistance", 100, 3000, 0, " studs")
 pageESP.CanvasSize = UDim2.new(0, 0, 0, e + 8)
 
 local pagePlayer = newPage("Player", 2)
@@ -615,15 +711,27 @@ selectTab("Aimbot")
 -- ============================================================
 
 local function newDrawing(class, props)
+    if not hasDrawing then
+        return nil
+    end
+
     local ok, obj = pcall(function()
         return Drawing.new(class)
     end)
     if not ok or not obj then
         return nil
     end
-    for k, v in pairs(props) do
-        obj[k] = v
+
+    local configured = pcall(function()
+        for k, v in pairs(props) do
+            obj[k] = v
+        end
+    end)
+    if not configured then
+        pcall(function() obj:Remove() end)
+        return nil
     end
+
     Drawings[#Drawings + 1] = obj
     return obj
 end
@@ -666,7 +774,9 @@ end
 local function hideESP(data)
     for _, obj in pairs(data) do
         if obj then
-            obj.Visible = false
+            pcall(function()
+                obj.Visible = false
+            end)
         end
     end
 end
@@ -685,97 +795,100 @@ local function updateESP()
 
     local cam = Workspace.CurrentCamera
     if not cam then
+        for _, data in pairs(ESPData) do
+            hideESP(data)
+        end
         return
     end
 
     local myTeam = LP.Team
 
     for _, plr in ipairs(Players:GetPlayers()) do
-        local data = getESP(plr)
-        if data then
-            local char = plr.Character
-            local head = char and char:FindFirstChild("Head")
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if plr ~= LP then
+            local data = getESP(plr)
+            if data then
+                local char = plr.Character
+                local head = char and char:FindFirstChild("Head")
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local show = head ~= nil and root ~= nil and hum ~= nil and hum.Health > 0
 
-            local show = plr ~= LP and head ~= nil and root ~= nil and hum ~= nil and hum.Health > 0
-
-            if show and Config.ESP.TeamCheck and myTeam ~= nil and plr.Team == myTeam then
-                show = false
-            end
-
-            local dist = 0
-            if show then
-                dist = (head.Position - cam.CFrame.Position).Magnitude
-                if dist > Config.ESP.MaxDistance then
+                if show and Config.ESP.TeamCheck and myTeam ~= nil and plr.Team == myTeam then
                     show = false
                 end
-            end
 
-            local top = nil
-            local bottom = nil
-            if show then
-                local topV, onScreen = cam:WorldToViewportPoint(head.Position + Vector3.new(0, 0.6, 0))
-                local bottomV = cam:WorldToViewportPoint(root.Position - Vector3.new(0, 2.7, 0))
-                if onScreen then
-                    top = topV
-                    bottom = bottomV
-                else
-                    show = false
+                local dist = 0
+                if show then
+                    dist = (head.Position - cam.CFrame.Position).Magnitude
+                    if dist > Config.ESP.MaxDistance then
+                        show = false
+                    end
                 end
-            end
 
-            if not show then
-                hideESP(data)
-            else
-                local h = math.abs(bottom.Y - top.Y)
-                if h < 6 then
+                local top, bottom
+                if show then
+                    local topV, topOnScreen = cam:WorldToViewportPoint(head.Position + Vector3.new(0, 0.6, 0))
+                    local bottomV, bottomOnScreen = cam:WorldToViewportPoint(root.Position - Vector3.new(0, 2.7, 0))
+                    if topV.Z > 0 and bottomV.Z > 0 and (topOnScreen or bottomOnScreen) then
+                        top = topV
+                        bottom = bottomV
+                    else
+                        show = false
+                    end
+                end
+
+                if not show then
                     hideESP(data)
                 else
-                    local w = h * 0.45
-                    local x = top.X - w / 2
-                    local boxY = top.Y
+                    local height = math.abs(bottom.Y - top.Y)
+                    if height < 6 then
+                        hideESP(data)
+                    else
+                        local width = height * 0.45
+                        local x = top.X - width / 2
+                        local boxY = top.Y
 
-                    if data.box then
-                        data.box.Visible = Config.ESP.Box
-                        data.box.Position = Vector2.new(x, boxY)
-                        data.box.Size = Vector2.new(w, h)
-                    end
-
-                    if data.nameTag then
-                        data.nameTag.Visible = Config.ESP.Name
-                        data.nameTag.Text = plr.Name
-                        data.nameTag.Position = Vector2.new(top.X, boxY - 16)
-                    end
-
-                    if data.distTag then
-                        data.distTag.Visible = Config.ESP.Distance
-                        data.distTag.Text = tostring(math.floor(dist)) .. "m"
-                        data.distTag.Position = Vector2.new(top.X, boxY + h + 3)
-                    end
-
-                    if data.hpBack and data.hpFill then
-                        local ratio = 0
-                        if hum.MaxHealth > 0 then
-                            ratio = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+                        if data.box then
+                            data.box.Visible = Config.ESP.Box
+                            data.box.Position = Vector2.new(x, boxY)
+                            data.box.Size = Vector2.new(width, height)
                         end
-                        data.hpBack.Visible = Config.ESP.Health
-                        data.hpFill.Visible = Config.ESP.Health
-                        data.hpBack.Position = Vector2.new(x - 6, boxY)
-                        data.hpBack.Size = Vector2.new(3, h)
-                        data.hpFill.Position = Vector2.new(x - 6, boxY + h * (1 - ratio))
-                        data.hpFill.Size = Vector2.new(3, h * ratio)
-                        data.hpFill.Color = Color3.fromRGB(
-                            math.floor(90 + 165 * (1 - ratio)),
-                            math.floor(90 + 165 * ratio),
-                            90
-                        )
-                    end
 
-                    if data.tracer then
-                        data.tracer.Visible = Config.ESP.Tracer
-                        data.tracer.From = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
-                        data.tracer.To = Vector2.new(bottom.X, bottom.Y)
+                        if data.nameTag then
+                            data.nameTag.Visible = Config.ESP.Name
+                            data.nameTag.Text = plr.Name
+                            data.nameTag.Position = Vector2.new(top.X, boxY - 16)
+                        end
+
+                        if data.distTag then
+                            data.distTag.Visible = Config.ESP.Distance
+                            data.distTag.Text = tostring(math.floor(dist)) .. " studs"
+                            data.distTag.Position = Vector2.new(top.X, boxY + height + 3)
+                        end
+
+                        if data.hpBack and data.hpFill then
+                            local ratio = 0
+                            if hum.MaxHealth > 0 then
+                                ratio = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+                            end
+                            data.hpBack.Visible = Config.ESP.Health
+                            data.hpFill.Visible = Config.ESP.Health
+                            data.hpBack.Position = Vector2.new(x - 6, boxY)
+                            data.hpBack.Size = Vector2.new(3, height)
+                            data.hpFill.Position = Vector2.new(x - 6, boxY + height * (1 - ratio))
+                            data.hpFill.Size = Vector2.new(3, height * ratio)
+                            data.hpFill.Color = Color3.fromRGB(
+                                math.floor(90 + 165 * (1 - ratio)),
+                                math.floor(90 + 165 * ratio),
+                                90
+                            )
+                        end
+
+                        if data.tracer then
+                            data.tracer.Visible = Config.ESP.Tracer
+                            data.tracer.From = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
+                            data.tracer.To = Vector2.new(bottom.X, bottom.Y)
+                        end
                     end
                 end
             end
@@ -787,11 +900,7 @@ bind(Players.PlayerRemoving, function(plr)
     local data = ESPData[plr]
     if data then
         for _, obj in pairs(data) do
-            if obj then
-                pcall(function()
-                    obj:Remove()
-                end)
-            end
+            removeDrawing(obj)
         end
         ESPData[plr] = nil
     end
@@ -841,7 +950,11 @@ local function isWallBlocked(part, plr)
     if not hit then
         return false
     end
-    return not hit.Instance:IsDescendantOf(plr.Character)
+    local targetCharacter = plr.Character
+    if not targetCharacter then
+        return true
+    end
+    return not hit.Instance:IsDescendantOf(targetCharacter)
 end
 
 local function findTarget()
@@ -850,7 +963,7 @@ local function findTarget()
         return nil
     end
 
-    local mouse = getMousePos()
+    local mouse = getViewportMousePos()
     local myTeam = LP.Team
     local best = nil
     local bestScore = math.huge
@@ -880,12 +993,12 @@ local function findTarget()
     return best
 end
 
-local function updateAimbot()
+local function updateAimbot(deltaTime)
     if fovCircle then
         local showFov = Config.Aimbot.Enabled and Config.Aimbot.ShowFOV
         fovCircle.Visible = showFov
         if showFov then
-            fovCircle.Position = getMousePos()
+            fovCircle.Position = getViewportMousePos()
             fovCircle.Radius = Config.Aimbot.FOV
         end
     end
@@ -910,12 +1023,15 @@ local function updateAimbot()
     end
 
     local goal = CFrame.lookAt(origin, target.Position)
-    cam.CFrame = cam.CFrame:Lerp(goal, math.clamp(Config.Aimbot.Smooth, 0.01, 1))
+    local smooth = math.clamp(Config.Aimbot.Smooth, 0.01, 1)
+    local dt = math.clamp(tonumber(deltaTime) or (1 / 60), 0, 0.1)
+    local alpha = 1 - ((1 - smooth) ^ (dt * 60))
+    cam.CFrame = cam.CFrame:Lerp(goal, math.clamp(alpha, 0, 1))
 end
 
-bind(RunService.RenderStepped, function()
+bind(RunService.RenderStepped, function(deltaTime)
     updateESP()
-    updateAimbot()
+    updateAimbot(deltaTime)
 end)
 
 -- ============================================================
@@ -923,10 +1039,10 @@ end)
 -- ============================================================
 
 bind(UserInputService.InputBegan, function(input, processed)
-    if input.KeyCode == Enum.KeyCode.RightShift then
+    if not processed and input.KeyCode == Enum.KeyCode.RightShift then
         main.Visible = not main.Visible
     end
-    if input.KeyCode == Config.Aimbot.Key and not processed then
+    if not processed and input.KeyCode == Config.Aimbot.Key then
         aiming = true
     end
 end)
@@ -942,24 +1058,71 @@ end)
 -- ============================================================
 
 unload = function()
-    for i = #Drawings, 1, -1 do
+    if isUnloaded then
+        return
+    end
+    isUnloaded = true
+    aiming = false
+    windowDragging = false
+    disconnectTransient(windowDragEndConnection)
+    windowDragEndConnection = nil
+    for i = #TransientConnections, 1, -1 do
+        disconnect(TransientConnections[i])
+        TransientConnections[i] = nil
+    end
+
+    -- Restore movement settings touched by this script.
+    for hum, original in pairs(OriginalHumanoidSettings) do
         pcall(function()
-            Drawings[i]:Remove()
+            if hum and hum.Parent then
+                hum.UseJumpPower = original.UseJumpPower
+                hum.WalkSpeed = original.WalkSpeed
+                hum.JumpPower = original.JumpPower
+            end
         end)
     end
+
     for i = #Connections, 1, -1 do
+        disconnect(Connections[i])
+        Connections[i] = nil
+    end
+
+    for i = #Drawings, 1, -1 do
+        local obj = Drawings[i]
         pcall(function()
-            Connections[i]:Disconnect()
+            obj.Visible = false
+        end)
+        pcall(function()
+            obj:Remove()
+        end)
+        Drawings[i] = nil
+    end
+
+    for plr, data in pairs(ESPData) do
+        ESPData[plr] = nil
+    end
+
+    if gui then
+        pcall(function()
+            gui:Destroy()
         end)
     end
-    ESPData = {}
-    if gui then
-        gui:Destroy()
+
+    if ENV.LUNAR and ENV.LUNAR.unload == unload then
+        ENV.LUNAR = nil
     end
-    ENV.LUNAR = nil
 end
 
 ENV.LUNAR = {
+    version = "1.1.0",
     unload = unload,
     config = Config,
+    getStatus = function()
+        return {
+            unloaded = isUnloaded,
+            drawingAvailable = hasDrawing,
+            connectionCount = #Connections + #TransientConnections,
+            drawingCount = #Drawings,
+        }
+    end,
 }
